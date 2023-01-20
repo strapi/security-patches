@@ -1,0 +1,87 @@
+diff --git a/node_modules/@strapi/utils/lib/index.js b/node_modules/@strapi/utils/lib/index.js
+index f09547a..6dfedfe 100644
+--- a/node_modules/@strapi/utils/lib/index.js
++++ b/node_modules/@strapi/utils/lib/index.js
+@@ -24,7 +24,7 @@ const {
+   joinBy,
+   toKebabCase,
+ } = require('./string-formatting');
+-const { removeUndefined } = require('./object-formatting');
++const { removeUndefined, keysDeep } = require('./object-formatting');
+ const { getConfigUrls, getAbsoluteAdminUrl, getAbsoluteServerUrl } = require('./config');
+ const { generateTimestampCode } = require('./code-generator');
+ const contentTypes = require('./content-types');
+@@ -38,6 +38,7 @@ const pagination = require('./pagination');
+ const sanitize = require('./sanitize');
+ const traverseEntity = require('./traverse-entity');
+ const pipeAsync = require('./pipe-async');
++const template = require('./template');
+ 
+ module.exports = {
+   yup,
+@@ -59,11 +60,13 @@ module.exports = {
+   getConfigUrls,
+   escapeQuery,
+   removeUndefined,
++  keysDeep,
+   getAbsoluteAdminUrl,
+   getAbsoluteServerUrl,
+   generateTimestampCode,
+   stringIncludes,
+   stringEquals,
++  template,
+   isKebabCase,
+   isCamelCase,
+   toKebabCase,
+diff --git a/node_modules/@strapi/utils/lib/object-formatting.js b/node_modules/@strapi/utils/lib/object-formatting.js
+index 23c1326..24c1b74 100644
+--- a/node_modules/@strapi/utils/lib/object-formatting.js
++++ b/node_modules/@strapi/utils/lib/object-formatting.js
+@@ -4,6 +4,12 @@ const _ = require('lodash');
+ 
+ const removeUndefined = (obj) => _.pickBy(obj, (value) => typeof value !== 'undefined');
+ 
++const keysDeep = (obj, path = []) =>
++  !_.isObject(obj)
++    ? path.join('.')
++    : _.reduce(obj, (acc, next, key) => _.concat(acc, keysDeep(next, [...path, key])), []);
++
+ module.exports = {
+   removeUndefined,
++  keysDeep,
+ };
+diff --git a/node_modules/@strapi/utils/lib/template.js b/node_modules/@strapi/utils/lib/template.js
+new file mode 100644
+index 0000000..25c83fe
+--- /dev/null
++++ b/node_modules/@strapi/utils/lib/template.js
+@@ -0,0 +1,28 @@
++'use strict';
++
++/**
++ * Create a strict interpolation RegExp based on the given variables' name
++ *
++ * @param {string[]} allowedVariableNames - The list of allowed variables
++ * @param {string} [flags] - The RegExp flags
++ */
++const createStrictInterpolationRegExp = (allowedVariableNames, flags) => {
++  const oneOfVariables = allowedVariableNames.join('|');
++
++  // 1. We need to match the delimiters: <%= ... %>
++  // 2. We accept any number of whitespaces characters before and/or after the variable name: \s* ... \s*
++  // 3. We only accept values from the variable list as interpolation variables' name: : (${oneOfVariables})
++  return new RegExp(`<%=\\s*(${oneOfVariables})\\s*%>`, flags);
++};
++
++/**
++ * Create a loose interpolation RegExp to match as many groups as possible
++ *
++ * @param {string} [flags] - The RegExp flags
++ */
++const createLooseInterpolationRegExp = (flags) => new RegExp(/<%=([\s\S]+?)%>/, flags);
++
++module.exports = {
++  createStrictInterpolationRegExp,
++  createLooseInterpolationRegExp,
++};
+\ No newline at end of file
