@@ -1,0 +1,184 @@
+diff --git a/node_modules/@strapi/plugin-users-permissions/server/controllers/validation/email-template.js b/node_modules/@strapi/plugin-users-permissions/server/controllers/validation/email-template.js
+index 8f3581d..b863d55 100644
+--- a/node_modules/@strapi/plugin-users-permissions/server/controllers/validation/email-template.js
++++ b/node_modules/@strapi/plugin-users-permissions/server/controllers/validation/email-template.js
+@@ -1,19 +1,19 @@
+ 'use strict';
+ 
+-const _ = require('lodash');
+-
+-const invalidPatternsRegexes = [/<%[^=]([^<>%]*)%>/m, /\${([^{}]*)}/m];
+-const authorizedKeys = [
+-  'URL',
+-  'ADMIN_URL',
+-  'SERVER_URL',
+-  'CODE',
+-  'USER',
+-  'USER.email',
+-  'USER.username',
+-  'TOKEN',
++const { trim } = require('lodash/fp');
++const {
++  template: { createLooseInterpolationRegExp, createStrictInterpolationRegExp },
++} = require('@strapi/utils');
++
++const invalidPatternsRegexes = [
++  // Ignore "evaluation" patterns: <% ... %>
++  /<%[^=]([\s\S]*?)%>/m,
++  // Ignore basic string interpolations
++  /\${([^{}]*)}/m,
+ ];
+ 
++const authorizedKeys = ['URL', 'CODE', 'USER', 'USER.email', 'USER.username', 'TOKEN'];
++
+ const matchAll = (pattern, src) => {
+   const matches = [];
+   let match;
+@@ -22,23 +22,37 @@ const matchAll = (pattern, src) => {
+   while ((match = regexPatternWithGlobal.exec(src))) {
+     const [, group] = match;
+ 
+-    matches.push(_.trim(group));
++    matches.push(trim(group));
+   }
++
+   return matches;
+ };
+ 
+ const isValidEmailTemplate = template => {
++  // Check for known invalid patterns
+   for (let reg of invalidPatternsRegexes) {
+     if (reg.test(template)) {
+       return false;
+     }
+   }
+ 
+-  const matches = matchAll(/<%=([^<>%=]*)%>/, template);
+-  for (const match of matches) {
+-    if (!authorizedKeys.includes(match)) {
+-      return false;
+-    }
++  const interpolation = {
++    // Strict interpolation pattern to match only valid groups
++    strict: createStrictInterpolationRegExp(authorizedKeys),
++    // Weak interpolation pattern to match as many group as possible.
++    loose: createLooseInterpolationRegExp(),
++  };
++
++  // Compute both strict & loose matches
++  const strictMatches = matchAll(interpolation.strict, template);
++  const looseMatches = matchAll(interpolation.loose, template);
++
++  // If we have more matches with the loose RegExp than with the strict one,
++  // then it means that at least one of the interpolation group is invalid
++  // Note: In the future, if we wanted to give more details for error formatting
++  // purposes, we could return the difference between the two arrays
++  if (looseMatches.length > strictMatches.length) {
++    return false;
+   }
+ 
+   return true;
+diff --git a/node_modules/@strapi/plugin-users-permissions/server/services/user.js b/node_modules/@strapi/plugin-users-permissions/server/services/user.js
+index ef63b0f..cadb1de 100644
+--- a/node_modules/@strapi/plugin-users-permissions/server/services/user.js
++++ b/node_modules/@strapi/plugin-users-permissions/server/services/user.js
+@@ -10,7 +10,7 @@ const crypto = require('crypto');
+ const bcrypt = require('bcryptjs');
+ const urlJoin = require('url-join');
+ 
+-const { getAbsoluteAdminUrl, getAbsoluteServerUrl, sanitize } = require('@strapi/utils');
++const { getAbsoluteServerUrl, sanitize } = require('@strapi/utils');
+ const { getService } = require('../utils');
+ 
+ module.exports = ({ strapi }) => ({
+@@ -58,8 +58,8 @@ module.exports = ({ strapi }) => ({
+    * Promise to fetch a/an user.
+    * @return {Promise}
+    */
+-  fetch(id, params) {
+-    return strapi.entityService.findOne('plugin::users-permissions.user', id, params);
++  fetch(params, populate) {
++    return strapi.query('plugin::users-permissions.user').findOne({ where: params, populate });
+   },
+ 
+   /**
+@@ -76,8 +76,8 @@ module.exports = ({ strapi }) => ({
+    * Promise to fetch all users.
+    * @return {Promise}
+    */
+-  fetchAll(params) {
+-    return strapi.entityService.findMany('plugin::users-permissions.user', params);
++  fetchAll(params, populate) {
++    return strapi.query('plugin::users-permissions.user').findMany({ where: params, populate });
+   },
+ 
+   /**
+@@ -116,17 +116,24 @@ module.exports = ({ strapi }) => ({
+     await this.edit(user.id, { confirmationToken });
+ 
+     const apiPrefix = strapi.config.get('api.rest.prefix');
+-    settings.message = await userPermissionService.template(settings.message, {
+-      URL: urlJoin(getAbsoluteServerUrl(strapi.config), apiPrefix, '/auth/email-confirmation'),
+-      SERVER_URL: getAbsoluteServerUrl(strapi.config),
+-      ADMIN_URL: getAbsoluteAdminUrl(strapi.config),
+-      USER: sanitizedUserInfo,
+-      CODE: confirmationToken,
+-    });
++    try {
++      settings.message = await userPermissionService.template(settings.message, {
++        URL: urlJoin(getAbsoluteServerUrl(strapi.config), apiPrefix, '/auth/email-confirmation'),
++        SERVER_URL: getAbsoluteServerUrl(strapi.config),
++        ADMIN_URL: getAbsoluteAdminUrl(strapi.config),
++        USER: sanitizedUserInfo,
++        CODE: confirmationToken,
++      });
+ 
+-    settings.object = await userPermissionService.template(settings.object, {
+-      USER: sanitizedUserInfo,
+-    });
++      settings.object = await userPermissionService.template(settings.object, {
++        USER: sanitizedUserInfo,
++      });
++    } catch {
++      strapi.log.error(
++        '[plugin::users-permissions.sendConfirmationEmail]: Failed to generate a template for "user confirmation email". Please make sure your email template is valid and does not contain invalid characters or patterns'
++      );
++      return;
++    }
+ 
+     // Send an email to the user.
+     await strapi
+diff --git a/node_modules/@strapi/plugin-users-permissions/server/services/users-permissions.js b/node_modules/@strapi/plugin-users-permissions/server/services/users-permissions.js
+index 2e6aea0..8e8b764 100644
+--- a/node_modules/@strapi/plugin-users-permissions/server/services/users-permissions.js
++++ b/node_modules/@strapi/plugin-users-permissions/server/services/users-permissions.js
+@@ -3,6 +3,11 @@
+ const _ = require('lodash');
+ const { filter, map, pipe, prop } = require('lodash/fp');
+ const urlJoin = require('url-join');
++const {
++  template: { createStrictInterpolationRegExp },
++  errors,
++  keysDeep,
++} = require('@strapi/utils');
+ 
+ const { getService } = require('../utils');
+ 
+@@ -230,7 +235,15 @@ module.exports = ({ strapi }) => ({
+   },
+ 
+   template(layout, data) {
+-    const compiledObject = _.template(layout);
+-    return compiledObject(data);
++    const allowedTemplateVariables = keysDeep(data);
++
++    // Create a strict interpolation RegExp based on possible variable names
++    const interpolate = createStrictInterpolationRegExp(allowedTemplateVariables, 'g');
++
++    try {
++      return _.template(layout, { interpolate, evaluate: false, escape: false })(data);
++    } catch (e) {
++      throw new errors.ApplicationError('Invalid email template');
++    }
+   },
+ });
