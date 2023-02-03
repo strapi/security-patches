@@ -1,0 +1,208 @@
+diff --git a/node_modules/strapi-plugin-users-permissions/controllers/validation/email-template.js b/node_modules/strapi-plugin-users-permissions/controllers/validation/email-template.js
+index ce455b5..766ec1a 100644
+--- a/node_modules/strapi-plugin-users-permissions/controllers/validation/email-template.js
++++ b/node_modules/strapi-plugin-users-permissions/controllers/validation/email-template.js
+@@ -1,8 +1,22 @@
+ 'use strict';
+ 
+-const _ = require('lodash');
++const { trim } = require('lodash/fp');
++
++const createStrictInterpolationRegExp = (allowedVariableNames, flags) => {
++  const oneOfVariables = allowedVariableNames.join('|');
++
++  return new RegExp(`<%=\\s*(${oneOfVariables})\\s*%>`, flags);
++};
++
++const createLooseInterpolationRegExp = (flags) => new RegExp(/<%=([\s\S]+?)%>/, flags);
++
++const invalidPatternsRegexes = [
++  // Ignore "evaluation" patterns: <% ... %>
++  /<%[^=]([\s\S]*?)%>/m,
++  // Ignore basic string interpolations
++  /\${([^{}]*)}/m,
++];
+ 
+-const invalidPatternsRegexes = [/<%[^=]([^<>%]*)%>/m, /\${([^{}]*)}/m];
+ const authorizedKeys = ['URL', 'CODE', 'USER', 'USER.email', 'USER.username', 'TOKEN'];
+ 
+ const matchAll = (pattern, src) => {
+@@ -13,7 +27,7 @@ const matchAll = (pattern, src) => {
+   while ((match = regexPatternWithGlobal.exec(src))) {
+     const [, group] = match;
+ 
+-    matches.push(_.trim(group));
++    matches.push(trim(group));
+   }
+   return matches;
+ };
+@@ -25,11 +39,18 @@ const isValidEmailTemplate = template => {
+     }
+   }
+ 
+-  const matches = matchAll(/<%=([^<>%=]*)%>/, template);
+-  for (const match of matches) {
+-    if (!authorizedKeys.includes(match)) {
+-      return false;
+-    }
++  const interpolation = {
++    // Strict interpolation pattern to match only valid groups
++    strict: createStrictInterpolationRegExp(authorizedKeys),
++    // Weak interpolation pattern to match as many group as possible.
++    loose: createLooseInterpolationRegExp(),
++  };
++
++  const strictMatches = matchAll(interpolation.strict, template);
++  const looseMatches = matchAll(interpolation.loose, template);
++
++  if (looseMatches.length > strictMatches.length) {
++    return false;
+   }
+ 
+   return true;
+diff --git a/node_modules/strapi-plugin-users-permissions/services/User.js b/node_modules/strapi-plugin-users-permissions/services/User.js
+index 0ad62ac..8ee2598 100644
+--- a/node_modules/strapi-plugin-users-permissions/services/User.js
++++ b/node_modules/strapi-plugin-users-permissions/services/User.js
+@@ -11,6 +11,69 @@ const bcrypt = require('bcryptjs');
+ 
+ const { sanitizeEntity, getAbsoluteServerUrl } = require('strapi-utils');
+ 
++function normalize (strArray) {
++  const resultArray = [];
++  if (strArray.length === 0) { return ''; }
++
++  if (typeof strArray[0] !== 'string') {
++    throw new TypeError('Url must be a string. Received ' + strArray[0]);
++  }
++
++  // If the first part is a plain protocol, we combine it with the next part.
++  if (strArray[0].match(/^[^/:]+:\/*$/) && strArray.length > 1) {
++    strArray[0] = strArray.shift() + strArray[0];
++  }
++
++  // There must be two or three slashes in the file protocol, two slashes in anything else.
++  if (strArray[0].match(/^file:\/\/\//)) {
++    strArray[0] = strArray[0].replace(/^([^/:]+):\/*/, '$1:///');
++  } else {
++    strArray[0] = strArray[0].replace(/^([^/:]+):\/*/, '$1://');
++  }
++
++  for (let i = 0; i < strArray.length; i++) {
++    let component = strArray[i];
++
++    if (typeof component !== 'string') {
++      throw new TypeError('Url must be a string. Received ' + component);
++    }
++
++    if (component === '') { continue; }
++
++    if (i > 0) {
++      // Removing the starting slashes for each component but the first.
++      component = component.replace(/^[\/]+/, '');
++    }
++    if (i < strArray.length - 1) {
++      // Removing the ending slashes for each component but the last.
++      component = component.replace(/[\/]+$/, '');
++    } else {
++      // For the last component we will combine multiple slashes to a single one.
++      component = component.replace(/[\/]+$/, '/');
++    }
++
++    resultArray.push(component);
++
++  }
++
++  let str = resultArray.join('/');
++  // Each input component is now separated by a single slash except the possible first plain protocol part.
++
++  // remove trailing slash before parameters or hash
++  str = str.replace(/\/(\?|&|#[^!])/g, '$1');
++
++  // replace ? in parameters with &
++  const parts = str.split('?');
++  str = parts.shift() + (parts.length > 0 ? '?': '') + parts.join('&');
++
++  return str;
++}
++
++function urlJoin(...args) {
++  const parts = Array.from(Array.isArray(args[0]) ? args[0] : args);
++  return normalize(parts);
++}
++
+ module.exports = {
+   /**
+    * Promise to count users
+@@ -143,13 +206,24 @@ module.exports = {
+ 
+     await this.edit({ id: user.id }, { confirmationToken });
+ 
+-    settings.message = await userPermissionService.template(settings.message, {
+-      URL: `${getAbsoluteServerUrl(strapi.config)}/auth/email-confirmation`,
+-      USER: userInfo,
+-      CODE: confirmationToken,
+-    });
+-
+-    settings.object = await userPermissionService.template(settings.object, { USER: userInfo });
++    try {
++      settings.message = await userPermissionService.template(settings.message, {
++        URL: urlJoin(getAbsoluteServerUrl(strapi.config), '/auth/email-confirmation'),
++        SERVER_URL: getAbsoluteServerUrl(strapi.config),
++        ADMIN_URL: getAbsoluteAdminUrl(strapi.config),
++        USER: userInfo,
++        CODE: confirmationToken,
++      });
++
++      settings.object = await userPermissionService.template(settings.object, {
++        USER: userInfo,
++      });
++    } catch {
++      strapi.log.error(
++        '[plugin::users-permissions.sendConfirmationEmail]: Failed to generate a template for "user confirmation email". Please make sure your email template is valid and does not contain invalid characters or patterns'
++      );
++      return;
++    }
+ 
+     // Send an email to the user.
+     await strapi.plugins['email'].services.email.send({
+diff --git a/node_modules/strapi-plugin-users-permissions/services/UsersPermissions.js b/node_modules/strapi-plugin-users-permissions/services/UsersPermissions.js
+index 08f97fc..fe6474b 100644
+--- a/node_modules/strapi-plugin-users-permissions/services/UsersPermissions.js
++++ b/node_modules/strapi-plugin-users-permissions/services/UsersPermissions.js
+@@ -9,6 +9,17 @@ const request = require('request');
+  * @description: A set of functions similar to controller's actions to avoid code duplication.
+  */
+ 
++const keysDeep = (obj, path = []) =>
++  !_.isObject(obj)
++    ? path.join('.')
++    : _.reduce(obj, (acc, next, key) => _.concat(acc, keysDeep(next, [...path, key])), []);
++
++const createStrictInterpolationRegExp = (allowedVariableNames, flags) => {
++  const oneOfVariables = allowedVariableNames.join('|');
++
++  return new RegExp(`<%=\\s*(${oneOfVariables})\\s*%>`, flags);
++};
++
+ const DEFAULT_PERMISSIONS = [
+   { action: 'admincallback', controller: 'auth', type: 'users-permissions', roleType: 'public' },
+   { action: 'adminregister', controller: 'auth', type: 'users-permissions', roleType: 'public' },
+@@ -410,7 +421,15 @@ module.exports = {
+   },
+ 
+   template(layout, data) {
+-    const compiledObject = _.template(layout);
+-    return compiledObject(data);
++    const allowedTemplateVariables = keysDeep(data);
++
++    // Create a strict interpolation RegExp based on possible variable names
++    const interpolate = createStrictInterpolationRegExp(allowedTemplateVariables, 'g');
++
++    try {
++      return _.template(layout, { interpolate, evaluate: false, escape: false })(data);
++    } catch (e) {
++      throw new Error('Invalid email template');
++    }
+   },
+ };

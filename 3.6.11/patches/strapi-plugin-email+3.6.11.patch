@@ -1,0 +1,43 @@
+diff --git a/node_modules/strapi-plugin-email/services/Email.js b/node_modules/strapi-plugin-email/services/Email.js
+index 797c17e..5c09913 100644
+--- a/node_modules/strapi-plugin-email/services/Email.js
++++ b/node_modules/strapi-plugin-email/services/Email.js
+@@ -2,6 +2,17 @@
+ 
+ const _ = require('lodash');
+ 
++const keysDeep = (obj, path = []) =>
++  !_.isObject(obj)
++    ? path.join('.')
++    : _.reduce(obj, (acc, next, key) => _.concat(acc, keysDeep(next, [...path, key])), []);
++
++const createStrictInterpolationRegExp = (allowedVariableNames, flags) => {
++  const oneOfVariables = allowedVariableNames.join('|');
++
++  return new RegExp(`<%=\\s*(${oneOfVariables})\\s*%>`, flags);
++};
++
+ const getProviderSettings = () => {
+   return strapi.plugins.email.config;
+ };
+@@ -26,10 +37,19 @@ const sendTemplatedEmail = (emailOptions = {}, emailTemplate = {}, data = {}) =>
+     );
+   }
+ 
++  const allowedInterpolationVariables = keysDeep(data);
++  const interpolate = createStrictInterpolationRegExp(allowedInterpolationVariables, 'g');
++
+   const templatedAttributes = attributes.reduce(
+     (compiled, attribute) =>
+       emailTemplate[attribute]
+-        ? Object.assign(compiled, { [attribute]: _.template(emailTemplate[attribute])(data) })
++        ? Object.assign(compiled, {
++            [attribute]: _.template(emailTemplate[attribute], {
++              interpolate,
++              evaluate: false,
++              escape: false,
++            })(data),
++          })
+         : compiled,
+     {}
+   );
